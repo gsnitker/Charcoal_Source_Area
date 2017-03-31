@@ -1,0 +1,281 @@
+---
+title: "Charcoal Aerial Dispersion and Source Area Model"
+subtitle: "Watershed V.1"
+author: "Grant Snitker - Arizona State University"
+date: "12/8/2016"
+output: html_document
+---
+### Model Description
+This R script adapts Clark's (1988) 2-d model of primary charcoal dispersion into a 3-d source area model for all cells located within a watershed.Charcoal assemblages recovered from the lower reaches of a watershed represent cumulative fire activity and vegetation located upstream of the sample location. These materials will have moved downstream due to channel flow, sheet wash, and other fluvial processes until they were periodically deposited during a high flow or flood event.
+
+### Set-up and Parameters
+
+##### *Set working directory and libraries*
+```{r Libraries, , message=FALSE}
+#setwd("Set working directory") # change to personal working directory
+library(raster)
+library(rgeos)
+library(pracma)
+library(plyr)
+library(rgdal)
+library(parallel)
+library(ggmap)
+library(ggplot2)
+library(maptools)
+```
+
+##### *Load required raster inputs, resample rasters to desired resolution, and select cells analysis*
+```{r Download Data, ,message=FALSE}
+### Download all required rasters from github
+download.file(url = "https://raw.githubusercontent.com/gsnitker/Charcoal_Source_Area/master/Valencia_DEM.tif", destfile = "./Valencia_DEM.tif", method = "auto") # elevation raster
+
+download.file(url = "https://raw.githubusercontent.com/gsnitker/Charcoal_Source_Area/master/navarres_50mres_wind_dir.tif", destfile = "./navarres_50mres_wind_dir.tif", method = "auto") # wind direction raster
+
+download.file(url = "https://raw.githubusercontent.com/gsnitker/Charcoal_Source_Area/master/navarres_50mres_wind_speed.tif", destfile = "./navarres_50mres_wind_speed.tif", method = "auto") # wind velocity raster
+
+download.file(url = "https://raw.githubusercontent.com/gsnitker/Charcoal_Source_Area/master/SP_NV_5.zip", destfile = "./SP_NV_5.zip", method = "auto") # watershed shapefile
+
+### Load downloaded data
+elev <- raster("Valencia_DEM.tif") # elevation
+wind_dir = raster("navarres_50mres_wind_dir.tif") # wind direction
+wind_vel = raster("navarres_50mres_wind_speed.tif") # wind velocity
+unzip("SP_NV_5.zip")
+sample.poly = shapefile("./SP_NV_5/SP_NV_5_Watershed.shp")
+
+### Re-project and re-sample data to desired resolution (in this case, resmaple to raster with the lowest resolution)
+#Re-project
+crs(elev) = "+proj=utm +zone=30 +datum=WGS84 +units=m +no_defs +ellps=WGS84 +towgs84=0,0,0"
+#Re-sample
+elev = resample(elev, wind_vel, method='bilinear')# re-sample rasters to the same resolution
+wind_dir = resample(wind_dir, wind_vel, method='bilinear') # re-sample rasters to the same resolution
+# reverse wind direction and keep within 360 degree scale
+wind_dir_trans_1 = wind_dir - 180 # reverse values
+wind_dir_trans_2 = wind_dir - 180 # reverse values
+wind_dir_trans_1[wind_dir_trans_1 <= 0] = NA #select positive values that need no more transformation 
+wind_dir_trans_2[wind_dir_trans_2 >= 0] = NA #select negative values that need more transformation 
+wind_dir_trans_2 = wind_dir_trans_2 + 360 # add 360 to values that were negative 
+wind_dir_trans = merge(wind_dir_trans_1,wind_dir_trans_2) # merge resulting rasters to create 0-360 inversed wind map
+wind_dir_trans[wind_dir_trans < 1] = 1 # clean up the values between teh 360-1 degree boundary
+
+#Extract a list of cells for the analysis from the watershed shapefile
+sample.list = unlist(cellFromPolygon(elev,sample.poly))
+```
+##### *Ex. of GIS data used in the watershed source model*
+```{r Plot Data, echo=FALSE}
+plot(elev, main = "Elevation (m) with watershed polygon")
+plot(sample.poly, add = TRUE)
+plot(wind_dir_trans, main = "Wind direction (degrees) with watershed polygon")
+plot(sample.poly, add = TRUE)
+plot(wind_vel, main = "Wind velocity (mph) with watershed polygon")
+plot(sample.poly, add = TRUE)
+```
+
+
+### Dispersion and Source Model
+
+
+##### **User input variables needed for the script**
+
+Variable Name  | Description                                 | Value    | Reference                            
+-------------- | ------------------------------------------- | -------- | ---------------------------------
+h              | Plume height (m)                            | 10       | Clark 1988; Peters & Higuera 2007
+d              | Particle size (μm)                          | 250      | Clark 1988; Peters & Higuera 2007
+
+
+##### **Constants needed for the script**
+
+Constant Name  | Description                                 | Value    | Reference                            
+-------------- | ------------------------------------------- | -------- | ---------------------------------
+Cy             | Diffusion Constant                          | 0.21     | Peters & Higuera 2007; Sutton 1947
+Cz             | Diffusion Constant                          | 0.12     | Peters & Higuera 2007; Sutton 1947
+n              | Turbulence Measure                          | 0.25     | Sutton 1947
+m              | n/(4−2n)                                    | --       | Peters & Higuera 2007
+Qo             | Source strength                             | 100000   | Peters & Higuera 2007
+pp             | Avg Particle density for charcoal (g/cm^-3) | 0.5      | Clark 1988; Sutton 1947
+pf             | Fluid density for air (g/cm^-3 )            | 0.00127  | Clark 1988; Sutton 1947
+v              | Kinematic viscosity for air (cm^2/sec^-1)   | 0.142    | Clark 1988; Sutton 1947
+g              | Accel. due to gravity (cm/sec^-2)           | 981      | Clark 1988; Sutton 1947
+
+
+##### *Complete code for dispersion and source model function*
+
+```{r Watershed Source Model Function}
+watershed.source.model = function(sample.list){
+  
+#######Create sample location and elevation
+sample_num <-sample.list
+sample = data.frame(xyFromCell(elev, sample_num))
+sample <-c(sample[,1], sample[,2]) 
+sample_elev = extract(elev, sample_num)
+
+
+#### Create Distance raster
+dist_rast <- distanceFromPoints(elev, sample)
+dist_rast = dist_rast
+
+#### Create Wind Direction Raster
+elev_NA = elev
+elev_NA[] = NA
+elev_NA[sample_num]= 1 
+# sample_num is the cell number for the sample location that was identified in the "import and create fire" section (for wtaershed analysis, this includes all teh cells located within teh drainage basin)
+azimuth_rast=direction(elev_NA, degrees=TRUE, from = TRUE)
+
+### Wind direction and difference raster
+wind_diff <- (azimuth_rast)-(wind_dir_trans)
+wind_diff_rads <- (wind_diff)*(pi/180)
+wind_y_adj <- overlay(dist_rast, wind_diff_rads, fun=function(x,y){return(sqrt(((x^2)+(x^2))-((2)*(x*x)*cos(y))))})
+wind_y_adj <- wind_y_adj 
+
+### Plume elevation adjustment  raster
+plume <- function(x) { x - sample_elev }
+plume_adj <- calc(elev, plume)
+#extract resolution for cell calculations
+res = (xres(elev))
+
+## User defined variables
+h = 10
+#u =  1 # user defined wind speed (m per sec ^-1 )
+d =  250  #user defined diameter of particle in microns
+#y = 0 # user defined to create cross section for y axis
+
+## Constants
+Cy = 0.21
+Cz = 0.12
+n = 0.25
+m = n/(4-(2 * n))
+Qo = 100000
+e = exp(1)
+pp = 0.5 # particle density for avg charcoal particle (g cm^-3) 
+pf = 0.00127 # Fluid density for air (g cm^-3 )
+v = 0.142 # kinematic viscosity for air (cm^2 sec^-1) 
+g = 981 # Accel. due to gravity (cm sec^-2).
+
+######### Settling Velocity equation (Stokes' Law)
+settle.vel = function(r){
+  dcent = 0.0001 * d
+  vg = ((pp-pf)*g*(dcent^2))/(18*v)
+  return(vg)
+}
+
+vg = settle.vel(r)
+
+######### Charcoal model equation for x
+disperse.x.y.elev.u = function(x,y,elev,u){
+  
+  ##Gamma function linear equivalent
+  f = function(t) {exp(-t)*(t^((-m)-1))}
+  xi = ((h + elev)^2)/(x^(2-n)*(Cz^2))
+  z = integrate(f, lower = xi, upper = 10000)
+  
+  ## Qx function
+  Qx = Qo*(exp(((4*vg)/(n*u*Cz*(sqrt(pi)))) * (((-x^(n/2))*(exp(-xi))) + (((h + elev)/Cz)^(2*m)) * (-m*z$value))))
+  
+  ## Dipsersal function
+  dispersal = (((2*vg*Qx)/(u*pi*Cy*Cz*(x^(2-n))))*(exp((-y^2)/((Cy^2)*(x^(2-n)))))*(exp((-(h + elev)^2)/((Cz^2)*(x^(2-n))))))
+  return(dispersal)
+}
+
+### Source area 
+source_area <- overlay(dist_rast, wind_y_adj, plume_adj, wind_vel, fun=disperse.x.y.elev.u)
+source_area[is.na(source_area)] = 0
+
+
+res_source_area = overlay(source_area, fun =function(x){x*res*res})
+sum_source_area = cellStats(res_source_area, sum)
+percent_source_area <- overlay(res_source_area, fun =function(x){x/sum_source_area})
+
+#Return the raster
+returnlist = list(percent_source_area)
+}
+```
+
+### Run Model and Process the Results
+##### *Command to run model in parallel*
+```{r Run Model}
+# Run watershed.source.model
+num.cores = detectCores()
+result.nested = mclapply(sample.list, function(i){watershed.source.model(i)}, mc.cores = num.cores)
+```
+
+##### *Process results for final map*
+```{r Process Results}
+#Unlist rasters from results and calculate percent likelihood for the source area
+watershed.source.model.result = unlist(result.nested)
+watershed.source.model.sum = calc(brick(watershed.source.model.result[1:length(watershed.source.model.result)]),sum)
+count.total = count(sample.list)
+watershed.percent.source.area = (watershed.source.model.sum/(sum(count.total[,2])))
+
+###Select cut-offs for displaying map (ie 30%, 50%, or standard deviations)
+values_list = as.data.frame(watershed.percent.source.area)
+values_list_descending = sort(values_list$layer, decreasing = TRUE)
+cumsum_list = cumsum(values_list_descending)
+
+#This example will use standard deviations for each cut-off
+###Quantile 1 standard deviation 
+per_1 <- which(cumsum_list < .68) # this is an adjustable percantage of the variation that the user would like to map
+last_1 = per_1[length(per_1)]
+
+###Quantile 2 standard deviations
+per_2 <- which(cumsum_list < .95) # this is an adjustable percantage of the variation that the user would like to map
+last_2 = per_2[length(per_2)]
+
+###Quantile 3 standard deviations
+per_3 <- which(cumsum_list < .997) # this is an adjustable percantage of the variation that the user would like to map
+last_3 = per_3[length(per_3)]
+
+###Group data by cut-off limits
+cut_off_1 = values_list_descending[last_1]
+cut_off_2 = values_list_descending[last_2]
+cut_off_3 = values_list_descending[last_3]
+
+##Code values in raster to reflect tehir cutt-off groups
+watershed.percent.source.area.final = watershed.percent.source.area
+watershed.percent.source.area.final[watershed.percent.source.area.final >= cut_off_1 & watershed.percent.source.area.final > 0] = 3
+watershed.percent.source.area.final[watershed.percent.source.area.final >= cut_off_2 & watershed.percent.source.area.final < cut_off_1] = 2
+watershed.percent.source.area.final[watershed.percent.source.area.final >= cut_off_3 & watershed.percent.source.area.final < cut_off_2 ] = 1
+```
+
+### Plot and save final result
+
+```{r}
+plot(watershed.percent.source.area.final)
+#writeRaster(watershed.percent.source.area.final, filename="Path to save", format="GTiff", overwrite=TRUE)
+```
+### A prettier plot
+```{r, ,message=FALSE}
+#Convert raster results to shapefiles, re-project the shapefiles into lat/long WGS84, and fortify results for plotting
+
+#Source areas as polygons
+source.areas <- rasterToPolygons(watershed.percent.source.area.final, fun=function(x){x>=1}, dissolve = F)
+source.areas <- spTransform(source.areas, CRS("+proj=longlat +datum=WGS84"))
+source.areas.fort = fortify(source.areas, region = "layer")
+
+#Transform Watershed shapefile
+sample.poly.lat.long =  spTransform(sample.poly, CRS("+proj=longlat +datum=WGS84"))
+
+#set up basemaps from Google Maps
+Navarres_region <- get_map(location=c(lon = -0.725, lat = 39.09), zoom = 13, source="google", maptype="terrain",  crop = T) 
+
+#Create plot using ggmap
+ggmap(Navarres_region) +
+  geom_polygon(aes(x=long, y=lat, group=group),data = sample.poly.lat.long, color ="black", size = .1, alpha = 0) +
+  geom_polygon(aes(x=long, y=lat, fill = id, group=group), data = source.areas.fort, alpha = .6) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  ggtitle("Charcoal Source Area Model\nWatershed v.1") +
+  scale_fill_discrete(name="Source Area\nLikelihood",
+                      breaks=c("1", "2", "3"),
+                      labels=c("99%", "95%", "68%"))
+```
+
+
+
+
+
+
+
+
+
+
+
+
